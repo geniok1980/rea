@@ -1,5 +1,6 @@
 import { Buffer } from "node:buffer";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import { createElfLoadMap } from "./ElfLoadMap.js";
 import {
   SNAPSHOT_HASH_LENGTH,
   SNAPSHOT_HASH_OFFSET,
@@ -58,15 +59,18 @@ export interface ElfParseFailure {
 }
 
 const SHT_DYNSYM = 11;
+const SHF_ALLOC = 2;
 const PT_LOAD = 1;
 const PT_DYNAMIC = 2;
 /** Position-independent executable images carry PT_DYNAMIC. */
 const ET_DYN = 3;
 const DT_NULL = 0;
+const DT_HASH = 4;
 const DT_STRTAB = 5;
 const DT_SYMTAB = 6;
 const DT_STRSZ = 10;
 const DT_SYMENT = 11;
+const DT_GNU_HASH = 0x6ffffef5;
 
 /** ELF32 needs 52 bytes, ELF64 needs 64; retain at most this prefix. */
 export const ELF_HEADER_MAX_BYTES = 64;
@@ -113,17 +117,18 @@ export const readElfHeader = (
     count > 0 &&
     count <= Math.floor((totalBytes - offset) / width);
   const MIN_SHENT = is64 ? 64 : 40;
-  // Section-stripped ET_DYN images keep their exported symbols reachable
-  // through PT_DYNAMIC instead of section headers; every other shape still
-  // needs a usable section header table.
+  // Section-stripped ET_DYN images may omit the section directory. This
+  // describes header availability, not which symbol-table source is usable.
   // A nonzero shoff with shnum=0 uses extended numbering, which this
   // parser does not support; it must not masquerade as a stripped image.
-  const dynamicFallback = e_type === ET_DYN && e_shoff === 0 && e_shnum === 0;
+  const sectionTableAbsent =
+    e_type === ET_DYN && e_shoff === 0 && e_shnum === 0;
   if (
     e_shoff === null ||
     e_shentsize === null ||
     e_shnum === null ||
-    (!dynamicFallback && !tableFits(e_shoff, e_shentsize, e_shnum, MIN_SHENT))
+    (!sectionTableAbsent &&
+      !tableFits(e_shoff, e_shentsize, e_shnum, MIN_SHENT))
   )
     return {
       failure: {
@@ -147,7 +152,7 @@ export const readElfHeader = (
   return {
     header: {
       is64,
-      dynamicFallback,
+      sectionTableAbsent,
       e_shoff,
       e_shentsize,
       e_shnum,
@@ -178,7 +183,7 @@ export const readElfSymbols = async (
   if (parsed.failure !== undefined) return failure(parsed.failure.reason);
   const {
     is64,
-    dynamicFallback,
+    sectionTableAbsent,
     e_shoff,
     e_shentsize,
     e_shnum,
@@ -205,6 +210,7 @@ export const readElfSymbols = async (
       vaddr === null ||
       offset === null ||
       filesz === null ||
+      !Number.isSafeInteger(vaddr + filesz) ||
       offset > bytes.length ||
       filesz > bytes.length - offset
     )
@@ -214,26 +220,39 @@ export const readElfSymbols = async (
       return failure("Multiple PT_DYNAMIC segments are ambiguous");
     else dynamicSegment = { offset, filesz };
   }
-  const toOffset = (vaddr: number, size: number): number | null => {
-    const segment = segments.find(
-      (candidate) =>
-        vaddr >= candidate.vaddr &&
-        vaddr - candidate.vaddr <= candidate.filesz &&
-        size <= candidate.filesz - (vaddr - candidate.vaddr),
-    );
-    return segment === undefined
-      ? null
-      : segment.offset + vaddr - segment.vaddr;
-  };
+  const toOffset = await createElfLoadMap(segments, signal);
   if (segments.length === 0)
     return failure("ELF image has no PT_LOAD segments");
   const tables: {
+    source: "section" | "dynamic-segment";
     offset: number;
     count: number;
     stringOffset: number;
     stringSize: number;
   }[] = [];
-  if (!dynamicFallback) {
+  /**
+   * The loader reads an allocated section through PT_LOAD, so its section
+   * offset must be the single file interpretation of its address range.
+   */
+  const sectionMappingFailure = (
+    header: number,
+    offset: number,
+    size: number,
+  ): string | undefined => {
+    const flags = is64 ? reader.u64(header + 8) : reader.u32(header + 8);
+    const address = is64
+      ? reader.u64(header + 0x10)
+      : reader.u32(header + 0x0c);
+    if (flags === null || address === null)
+      return "has an unrepresentable section header";
+    if ((flags & SHF_ALLOC) === 0) return undefined;
+    const mapped = toOffset(address, size);
+    if (!mapped.ok) return mapped.error.reason;
+    return mapped.value === offset
+      ? undefined
+      : "section offset disagrees with its PT_LOAD mapping";
+  };
+  if (!sectionTableAbsent) {
     for (let index = 0; index < e_shnum; index += 1) {
       if (index % 4096 === 0) {
         await yieldToEventLoop();
@@ -277,14 +296,29 @@ export const readElfSymbols = async (
         return failure(
           "Dynamic symbol strings are out of bounds or not a string table",
         );
+      const symbolMapping = sectionMappingFailure(header, offset, size);
+      if (symbolMapping !== undefined)
+        return failure(`Dynamic symbol table ${symbolMapping}`);
+      const stringMapping = sectionMappingFailure(
+        stringHeader,
+        stringOffset,
+        stringSize,
+      );
+      if (stringMapping !== undefined)
+        return failure(`Dynamic symbol string table ${stringMapping}`);
       tables.push({
+        source: "section",
         offset,
         count: size / entrySize,
         stringOffset,
         stringSize,
       });
     }
-  } else if (dynamicSegment !== null) {
+  }
+  // A retained section directory may omit SHT_DYNSYM while PT_DYNAMIC still
+  // describes the runtime symbols. A malformed present section already failed
+  // above; it must not be bypassed by an alternative interpretation.
+  if (tables.length === 0 && dynamicSegment !== null) {
     const tags = new Map<number, number>();
     const dynamicEntrySize = is64 ? 16 : 8;
     let terminated = false;
@@ -298,19 +332,29 @@ export const readElfSymbols = async (
         signal?.throwIfAborted();
       }
       const tag = is64 ? reader.u64(base) : reader.u32(base);
-      const value = is64 ? reader.u64(base + 8) : reader.u32(base + 4);
-      if (tag === null || value === null)
-        return failure("Dynamic entry is not representable");
+      if (tag === null) return failure("Dynamic entry is not representable");
+      // ELF defines d_un as ignored for DT_NULL; validate the complete entry
+      // above, but do not interpret a value that has no meaning.
       if (tag === DT_NULL) {
         terminated = true;
         break;
       }
+      // Interpret d_un only for the symbol-table description consumed here.
+      // In particular, DT_SYMBOLIC, DT_TEXTREL and DT_BIND_NOW have ignored
+      // payloads under the ELF ABI; their arbitrary bits are not numeric bounds.
       if (
-        ![DT_SYMTAB, DT_STRTAB, DT_STRSZ, DT_SYMENT, 4, 0x6ffffef5].includes(
-          tag,
-        )
+        ![
+          DT_SYMTAB,
+          DT_STRTAB,
+          DT_STRSZ,
+          DT_SYMENT,
+          DT_HASH,
+          DT_GNU_HASH,
+        ].includes(tag)
       )
         continue;
+      const value = is64 ? reader.u64(base + 8) : reader.u32(base + 4);
+      if (value === null) return failure("Dynamic entry is not representable");
       if (tags.has(tag) && tags.get(tag) !== value)
         return failure("Conflicting dynamic table tags");
       tags.set(tag, value);
@@ -331,30 +375,29 @@ export const readElfSymbols = async (
     // DT_HASH's nchain is the dynsym count. GNU hash instead records the
     // first hashed index and bounded buckets/chains. No payload-to-EOF walk.
     let count: number;
-    const sysv = tags.get(4);
-    const gnu = tags.get(0x6ffffef5);
+    const sysv = tags.get(DT_HASH);
+    const gnu = tags.get(DT_GNU_HASH);
     if (sysv !== undefined) {
       const at = toOffset(sysv, 8);
-      if (at === null) return failure("DT_HASH header is not file-backed");
-      const buckets = reader.u32(at)!;
-      count = reader.u32(at + 4)!;
-      if (toOffset(sysv, 8 + 4 * (buckets + count)) === null)
-        return failure("DT_HASH table is truncated");
+      if (!at.ok) return failure(`DT_HASH header ${at.error.reason}`);
+      const buckets = reader.u32(at.value)!;
+      count = reader.u32(at.value + 4)!;
+      const table = toOffset(sysv, 8 + 4 * (buckets + count));
+      if (!table.ok) return failure(`DT_HASH table ${table.error.reason}`);
     } else if (gnu !== undefined) {
       const at = toOffset(gnu, 16);
-      if (at === null) return failure("DT_GNU_HASH header is not file-backed");
-      const buckets = reader.u32(at)!;
-      const firstSymbol = reader.u32(at + 4)!;
-      const bloomWords = reader.u32(at + 8)!;
+      if (!at.ok) return failure(`DT_GNU_HASH header ${at.error.reason}`);
+      const buckets = reader.u32(at.value)!;
+      const firstSymbol = reader.u32(at.value + 4)!;
+      const bloomWords = reader.u32(at.value + 8)!;
       const prefixBytes = 16 + bloomWords * (is64 ? 8 : 4) + buckets * 4;
-      if (
-        buckets === 0 ||
-        bloomWords === 0 ||
-        toOffset(gnu, prefixBytes) === null
-      )
+      if (buckets === 0 || bloomWords === 0)
         return failure("DT_GNU_HASH buckets are malformed");
+      const prefix = toOffset(gnu, prefixBytes);
+      if (!prefix.ok)
+        return failure(`DT_GNU_HASH buckets ${prefix.error.reason}`);
       let last = 0;
-      const bucketsAt = at + 16 + bloomWords * (is64 ? 8 : 4);
+      const bucketsAt = at.value + 16 + bloomWords * (is64 ? 8 : 4);
       for (let index = 0; index < buckets; index += 1) {
         if (index % 4096 === 0) {
           await yieldToEventLoop();
@@ -374,9 +417,10 @@ export const readElfSymbols = async (
             signal?.throwIfAborted();
           }
           const span = prefixBytes + (index - firstSymbol + 1) * 4;
-          if (toOffset(gnu, span) === null)
-            return failure("DT_GNU_HASH chain is unterminated");
-          const chain = reader.u32(at + span - 4)!;
+          const range = toOffset(gnu, span);
+          if (!range.ok)
+            return failure(`DT_GNU_HASH chain ${range.error.reason}`);
+          const chain = reader.u32(at.value + span - 4)!;
           index += 1;
           if ((chain & 1) !== 0) {
             count = index;
@@ -388,14 +432,23 @@ export const readElfSymbols = async (
       return failure("Stripped ELF has no DT_HASH or DT_GNU_HASH symbol count");
     const offset = toOffset(sym, count * entrySize);
     const stringOffset = toOffset(str, stringSize);
-    if (offset === null || stringOffset === null)
-      return failure("Dynamic symbol or string table is not file-backed");
-    tables.push({ offset, count, stringOffset, stringSize });
+    if (!offset.ok)
+      return failure(`Dynamic symbol table ${offset.error.reason}`);
+    if (!stringOffset.ok)
+      return failure(`Dynamic string table ${stringOffset.error.reason}`);
+    tables.push({
+      source: "dynamic-segment",
+      offset: offset.value,
+      count,
+      stringOffset: stringOffset.value,
+      stringSize,
+    });
   }
   const wanted = new Set(symbolNames);
   const symbols = new Map<string, ElfSymbol>();
   const ambiguous = new Set<string>();
-  const failures: ElfParseFailure[] = [];
+  const unresolved = new Set<string>();
+  const failures = new Set<string>();
   for (const table of tables) {
     for (let index = 0; index < table.count; index += 1) {
       if (index % 4096 === 0) {
@@ -409,7 +462,7 @@ export const readElfSymbols = async (
         sectionIndex === 0xfff1 ||
         (sectionIndex > 0 &&
           sectionIndex < 0xff00 &&
-          (dynamicFallback || sectionIndex < e_shnum));
+          (table.source === "dynamic-segment" || sectionIndex < e_shnum));
       if (!defined || nameOffset >= table.stringSize) continue;
       const name = reader.cString(
         table.stringOffset + nameOffset,
@@ -419,33 +472,37 @@ export const readElfSymbols = async (
       const value = is64 ? reader.u64(base + 8) : reader.u32(base + 4);
       const size = is64 ? reader.u64(base + 16) : reader.u32(base + 8);
       if (value === null || size === null) {
-        failures.push({ reason: `Symbol ${name} has unrepresentable bounds` });
+        failures.add(`Symbol ${name} has unrepresentable bounds`);
+        unresolved.add(name);
         continue;
       }
       const offset = toOffset(value, size);
-      if (offset === null) {
-        failures.push({ reason: `Symbol ${name} has no file-backed range` });
+      if (!offset.ok) {
+        failures.add(`Symbol ${name} ${offset.error.reason}`);
+        unresolved.add(name);
         continue;
       }
       const previous = symbols.get(name);
       if (
         previous !== undefined &&
-        (previous.offset !== offset || previous.size !== size)
+        (previous.offset !== offset.value || previous.size !== size)
       )
         ambiguous.add(name);
-      else symbols.set(name, { name, offset, size });
+      else symbols.set(name, { name, offset: offset.value, size });
     }
   }
   for (const name of ambiguous) {
     symbols.delete(name);
-    failures.push({ reason: `Symbol ${name} has conflicting definitions` });
+    failures.add(`Symbol ${name} has conflicting definitions`);
   }
+  for (const name of unresolved) symbols.delete(name);
   for (const name of wanted)
-    if (!symbols.has(name))
-      failures.push({
-        reason: `symbol ${name} is not in the dynamic symbol table`,
-      });
-  return { symbols: [...symbols.values()], failures };
+    if (!symbols.has(name) && !ambiguous.has(name) && !unresolved.has(name))
+      failures.add(`symbol ${name} is not in the dynamic symbol table`);
+  return {
+    symbols: [...symbols.values()],
+    failures: [...failures].map((reason) => ({ reason })),
+  };
 };
 
 /** Read one Dart snapshot section header from its file offset. */
